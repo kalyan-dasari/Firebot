@@ -1,12 +1,16 @@
 """
 Slice game bot starter for Windows + Android USB/ADB.
+Specialized for Slice UPI 'Play Fire' Game (falling asteroid & fireball slicing).
 
-Default mode is OBSERVE ONLY. It captures the phone screen and draws
-heuristic candidate boxes. Automated swipes are disabled unless --auto
-is explicitly supplied.
-
-Detection is a starter heuristic, not a trained classifier. Calibrate it
-against real gameplay before enabling actions.
+Features:
+- Live Android screen capture via ADB.
+- Multi-direction (vertical & diagonal asteroid) trajectory tracking.
+- Perpendicular swipe cuts tailored to falling fireball angles & velocity.
+- Latency compensation (leads targets to hit moderate-to-fast falling fireballs).
+- Strict devil ball (bomb/hazard) safety buffer to prevent touching hazards.
+- Slicing zone filtering (avoids top headers and bottom navigation docks).
+- Offline calibration on static screenshots (--image).
+- Real-time simulation mode (--demo) with diagonal asteroids and speed variations.
 """
 import argparse
 import math
@@ -17,7 +21,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -141,8 +145,8 @@ def capture_screen(device: Optional[str] = None, adb_path: Optional[str] = None)
 
 def classify_crop(crop):
     """
-    Roughly classify one candidate crop using color ratios.
-    Returns (label, confidence). Confidence is only a heuristic score.
+    Classify one candidate crop using color ratios.
+    Identifies FIREBALL (bright core + warm flame) vs BOMB / DEVIL BALL (dark face + red eyes + warm outline).
     """
     if crop is None or crop.size == 0:
         return "UNKNOWN", 0.0
@@ -164,7 +168,7 @@ def classify_crop(crop):
     dark_ratio = float(np.count_nonzero(dark)) / total
     red_ratio = float(np.count_nonzero(red_eye)) / total
 
-    # Devil/skull candidates: dark face plus red details and/or warm outline.
+    # Devil ball / skull candidates: dark face plus red details and/or warm outline.
     if dark_ratio > 0.12 and red_ratio > 0.008 and warm_ratio > 0.025:
         score = min(0.95, 0.45 + dark_ratio * 0.6 + red_ratio * 5)
         return "BOMB", score
@@ -174,7 +178,7 @@ def classify_crop(crop):
         score = min(0.92, 0.45 + white_ratio * 0.8 + warm_ratio * 0.35)
         return "FIREBALL", score
 
-    # If there is a lot of dark and warm color, treat as a possible hazard.
+    # If there is a lot of dark and warm color, treat conservatively as a hazard.
     if dark_ratio > 0.20 and warm_ratio > 0.04:
         return "UNKNOWN", 0.35
 
@@ -184,7 +188,7 @@ def classify_crop(crop):
 def detect_objects(frame):
     """
     Build candidate blobs from warm flame pixels plus bright head pixels.
-    Morphology joins nearby trail/head pixels; tune kernel sizes if needed.
+    Morphology joins nearby trail/head pixels.
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
@@ -225,23 +229,160 @@ def detect_objects(frame):
         label, score = classify_crop(frame[y0:y1, x0:x1])
         detections.append(Detection((x0, y0, x1-x0, y1-y0), label, score))
 
-    # Prefer larger candidates; avoid flooding the preview with tiny fragments.
+    # Prefer larger candidates; avoid flooding preview with tiny fragments.
     detections.sort(key=lambda d: d.box[2] * d.box[3], reverse=True)
     return detections[:40]
 
 
-def segment_distance_to_rect(x1, y1, x2, y2, rect):
-    """Conservative approximate safety check using expanded swipe bounding box."""
-    rx, ry, rw, rh = rect
-    margin = 55
-    left, top = rx - margin, ry - margin
-    right, bottom = rx + rw + margin, ry + rh + margin
-    sx1, sx2 = min(x1, x2), max(x1, x2)
-    sy1, sy2 = min(y1, y2), max(y1, y2)
-    return not (sx2 < left or sx1 > right or sy2 < top or sy1 > bottom)
+def point_to_segment_dist(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
+    """Shortest Euclidean distance from point (px, py) to line segment (x1, y1)-(x2, y2)."""
+    dx = x2 - x1
+    dy = y2 - y1
+    seg_len_sq = dx * dx + dy * dy
+    if seg_len_sq == 0:
+        return math.hypot(px - x1, py - y1)
+    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / seg_len_sq))
+    return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
 
 
-def send_swipe(x1, y1, x2, y2, duration_ms=100, device: Optional[str] = None, adb_path: Optional[str] = None):
+def is_swipe_blocked_by_hazards(
+    x1: float, y1: float, x2: float, y2: float,
+    hazards: List[Detection],
+    safety_margin: float = 75.0,
+    lead_time: float = 0.06
+) -> bool:
+    """
+    Ironclad devil-ball safety guard.
+    Verifies that the swipe cut never intersects or comes close to any devil ball / bomb,
+    checking both its current position and projected future position.
+    """
+    for h in hazards:
+        hx, hy, hw, hh = h.box
+        hcx = hx + hw / 2.0
+        hcy = hy + hh / 2.0
+        danger_radius = max(hw, hh) / 2.0 + safety_margin
+
+        # 1. Exact Euclidean distance to current hazard center
+        if point_to_segment_dist(hcx, hcy, x1, y1, x2, y2) < danger_radius:
+            return True
+
+        # 2. Distance to projected future hazard center (assuming standard downward motion)
+        pred_hcy = hcy + 380.0 * lead_time
+        if point_to_segment_dist(hcx, pred_hcy, x1, y1, x2, y2) < danger_radius:
+            return True
+
+        # 3. Expanded AABB box overlap backup check
+        margin = safety_margin * 0.75
+        left, top = hx - margin, hy - margin
+        right, bottom = hx + hw + margin, hy + hh + margin
+        sx1, sx2 = min(x1, x2), max(x1, x2)
+        sy1, sy2 = min(y1, y2), max(y1, y2)
+        if not (sx2 < left or sx1 > right or sy2 < top or sy1 > bottom):
+            return True
+
+    return False
+
+
+def compute_swipe_endpoints(
+    cx: float, cy: float,
+    vx: float, vy: float,
+    half_stroke: float,
+    W_frame: int, H_frame: int,
+    lead_time: float = 0.06
+) -> Tuple[int, int, int, int]:
+    """
+    Calculate swipe cut endpoints perpendicular to the asteroid/fireball trajectory,
+    leading the target position by lead_time to hit moderate-to-fast moving fireballs.
+    """
+    # Predict future position of the falling fireball
+    target_x = cx + vx * lead_time
+    target_y = cy + vy * lead_time
+
+    speed = math.hypot(vx, vy)
+    if speed < 20.0:
+        # Stationary or very slow: standard horizontal cut
+        ux, uy = 1.0, 0.0
+    else:
+        # Unit vector of motion
+        mx = vx / speed
+        my = vy / speed
+        # Perpendicular unit vector (-my, mx)
+        ux = -my
+        uy = mx
+
+    x1 = int(target_x - ux * half_stroke)
+    y1 = int(target_y - uy * half_stroke)
+    x2 = int(target_x + ux * half_stroke)
+    y2 = int(target_y + uy * half_stroke)
+
+    # Clamp endpoints inside active screen boundaries
+    x1 = max(5, min(W_frame - 5, x1))
+    x2 = max(5, min(W_frame - 5, x2))
+    y1 = max(5, min(H_frame - 5, y1))
+    y2 = max(5, min(H_frame - 5, y2))
+
+    return x1, y1, x2, y2
+
+
+class SimpleTracker:
+    """Tracks moving objects across frames to compute velocity vectors and trajectories."""
+
+    def __init__(self, max_distance: float = 175.0):
+        self.tracks: Dict[int, dict] = {}
+        self.next_id: int = 1
+        self.max_distance = max_distance
+
+    def update(self, detections: List[Detection], now: float) -> Dict[int, dict]:
+        updated = {}
+        used = set()
+
+        for tid, info in self.tracks.items():
+            best_i = None
+            best_dist = self.max_distance
+            for i, d in enumerate(detections):
+                if i in used or d.kind != info["kind"]:
+                    continue
+                cx = d.box[0] + d.box[2] // 2
+                cy = d.box[1] + d.box[3] // 2
+                dist = math.hypot(cx - info["cx"], cy - info["cy"])
+                if dist < best_dist:
+                    best_dist = dist
+                    best_i = i
+
+            if best_i is not None:
+                used.add(best_i)
+                d = detections[best_i]
+                cx = d.box[0] + d.box[2] // 2
+                cy = d.box[1] + d.box[3] // 2
+                dt = max(0.015, now - info["time"])
+                inst_vx = (cx - info["cx"]) / dt
+                inst_vy = (cy - info["cy"]) / dt
+                # Exponential moving average filter
+                vx = 0.65 * inst_vx + 0.35 * info["vx"]
+                vy = 0.65 * inst_vy + 0.35 * info["vy"]
+                updated[tid] = {
+                    "cx": cx, "cy": cy, "vx": vx, "vy": vy,
+                    "time": now, "box": d.box, "kind": d.kind,
+                    "confidence": d.confidence, "detection": d
+                }
+
+        # Register new objects entering screen
+        for i, d in enumerate(detections):
+            if i not in used:
+                cx = d.box[0] + d.box[2] // 2
+                cy = d.box[1] + d.box[3] // 2
+                updated[self.next_id] = {
+                    "cx": cx, "cy": cy, "vx": 0.0, "vy": 380.0,
+                    "time": now, "box": d.box, "kind": d.kind,
+                    "confidence": d.confidence, "detection": d
+                }
+                self.next_id += 1
+
+        self.tracks = updated
+        return self.tracks
+
+
+def send_swipe(x1, y1, x2, y2, duration_ms=65, device: Optional[str] = None, adb_path: Optional[str] = None):
     """Send an automated touch swipe event via ADB."""
     p = run_adb([
         "shell", "input", "swipe",
@@ -253,21 +394,26 @@ def send_swipe(x1, y1, x2, y2, duration_ms=100, device: Optional[str] = None, ad
 
 
 class DemoSimulator:
-    """Simulates real-time gameplay with fireballs falling from top to bottom."""
+    """
+    Simulates Slice UPI 'Play Fire' gameplay with diagonal asteroids and falling fireballs
+    with varied moderate-to-fast velocities.
+    """
 
     def __init__(self, width: int = 540, height: int = 960):
         self.width = width
         self.height = height
         self.objects = []
-        self.swipes = []  # active visual swipe animations
-        self.last_spawn = 0.0  # Spawn immediately on start
+        self.swipes = []
+        self.last_spawn = 0.0
 
     def _spawn_object(self):
-        kind = random.choices(["FIREBALL", "BOMB"], weights=[0.75, 0.25])[0]
-        x = random.randint(int(self.width * 0.15), int(self.width * 0.85))
-        y = -25  # Spawn above the screen, falling downwards
-        vx = random.uniform(-1.0, 1.0)
-        vy = random.uniform(5.5, 9.5)  # Downward velocity
+        kind = random.choices(["FIREBALL", "BOMB"], weights=[0.72, 0.28])[0]
+        x = random.randint(int(self.width * 0.1), int(self.width * 0.9))
+        y = -28
+        # Diagonal asteroid trajectories: horizontal velocity (-4.5 to +4.5)
+        vx = random.uniform(-4.5, 4.5)
+        # Moderate-to-faster downward speed (6.5 to 14.0)
+        vy = random.uniform(6.5, 14.0)
         self.objects.append({
             "x": x, "y": y, "vx": vx, "vy": vy,
             "kind": kind, "alive": True
@@ -275,21 +421,20 @@ class DemoSimulator:
 
     def trigger_swipe(self, x1, y1, x2, y2):
         self.swipes.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "alpha": 1.0})
-        # Check if any falling fireball intersects the horizontal swipe segment
-        sx_min, sx_max = min(x1, x2), max(x1, x2)
+        # Check if swipe stroke cuts any falling fireball
         for obj in self.objects:
             if obj["kind"] == "FIREBALL" and obj["alive"]:
-                ox, oy = obj["x"], obj["y"]
-                if sx_min - 25 <= ox <= sx_max + 25 and abs(oy - y1) < 45:
+                dist = point_to_segment_dist(obj["x"], obj["y"], x1, y1, x2, y2)
+                if dist < 42.0:
                     obj["alive"] = False
 
     def next_frame(self) -> np.ndarray:
         now = time.time()
-        if now - self.last_spawn > random.uniform(0.9, 1.5):
+        if now - self.last_spawn > random.uniform(0.85, 1.4):
             self._spawn_object()
             self.last_spawn = now
 
-        # Dark game background
+        # Dark sleek game background
         frame = np.full((self.height, self.width, 3), (22, 18, 28), dtype=np.uint8)
 
         # Update and render falling objects
@@ -304,21 +449,26 @@ class DemoSimulator:
                 continue
 
             if obj["kind"] == "FIREBALL":
-                # Fireball falling down: flame trail points UPWARDS behind head
-                cv2.ellipse(frame, (ox, oy - 12), (20, 32), 0, 0, 360, (25, 130, 255), -1)
-                # Bright white core at the leading head
+                # Meteor/asteroid flame trail oriented along motion vector
+                spd = max(1.0, math.hypot(obj["vx"], obj["vy"]))
+                tail_len = min(22, max(12, int(spd * 1.6)))
+                tx = ox - int((obj["vx"] / spd) * tail_len)
+                ty = oy - int((obj["vy"] / spd) * tail_len)
+                angle_deg = math.degrees(math.atan2(obj["vy"], obj["vx"])) - 90
+                cv2.ellipse(frame, (tx, ty), (18, 30), angle_deg, 0, 360, (25, 130, 255), -1)
+                # Bright white core at the head
                 cv2.circle(frame, (ox, oy), 13, (255, 255, 255), -1)
             else:
-                # Bomb: dark body with warm outline & red eyes
+                # Devil Ball / Hazard: dark face, warm outline, red glowing eyes
                 cv2.circle(frame, (ox, oy), 26, (15, 95, 230), 4)
                 cv2.circle(frame, (ox, oy), 22, (32, 32, 32), -1)
                 cv2.circle(frame, (ox - 7, oy - 4), 3, (15, 15, 240), -1)
                 cv2.circle(frame, (ox + 7, oy - 4), 3, (15, 15, 240), -1)
 
-        # Remove objects that reached the bottom
+        # Remove objects that reached bottom
         self.objects = [o for o in self.objects if o["y"] < self.height + 60 and o["alive"]]
 
-        # Draw swipe trails
+        # Draw swipe animation trails
         active_swipes = []
         for s in self.swipes:
             p1 = (int(s["x1"]), int(s["y1"]))
@@ -365,31 +515,35 @@ def process_image_file(image_path: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="USB-connected Slice game bot starter for Android")
+    parser = argparse.ArgumentParser(description="USB Slice Bot for Android — Specialized for Slice UPI Fire Game")
     parser.add_argument("--auto", action="store_true",
-                        help="enable experimental swipes (disabled by default)")
-    parser.add_argument("--min-confidence", type=float, default=0.60,
-                        help="minimum heuristic fireball score for auto mode (default: 0.60)")
-    parser.add_argument("--cooldown", type=float, default=0.55,
-                        help="minimum seconds between automated swipes (default: 0.55)")
-    parser.add_argument("--swipe-length", type=int, default=120,
-                        help="length of horizontal slice cut in pixels (default: 120)")
-    parser.add_argument("--swipe-duration", type=int, default=70,
-                        help="swipe touch duration in ms (default: 70)")
+                        help="enable automated swipes (observe-only by default)")
+    parser.add_argument("--min-confidence", type=float, default=0.58,
+                        help="minimum heuristic fireball score for auto mode (default: 0.58)")
+    parser.add_argument("--cooldown", type=float, default=0.42,
+                        help="minimum seconds between automated swipes (default: 0.42)")
+    parser.add_argument("--swipe-length", type=int, default=130,
+                        help="length of slice cut stroke in pixels (default: 130)")
+    parser.add_argument("--swipe-duration", type=int, default=65,
+                        help="touch swipe duration in ms (default: 65)")
+    parser.add_argument("--lead-time", type=float, default=0.065,
+                        help="lead time in seconds to compensate for touch latency on fast balls (default: 0.065)")
+    parser.add_argument("--devil-margin", type=float, default=75.0,
+                        help="strict safety radius around devil balls in pixels (default: 75)")
     parser.add_argument("--zone-min", type=float, default=0.15,
-                        help="top fraction of screen to ignore, e.g. top UI (default: 0.15)")
-    parser.add_argument("--zone-max", type=float, default=0.85,
-                        help="bottom fraction of screen to ignore, e.g. bottom bar (default: 0.85)")
+                        help="top fraction of screen to ignore (avoids top headers/coins, default: 0.15)")
+    parser.add_argument("--zone-max", type=float, default=0.88,
+                        help="bottom fraction of screen to ignore (avoids bottom nav bar, default: 0.88)")
     parser.add_argument("--device", "-s", type=str, default=None,
                         help="target specific ADB device serial if multiple devices are attached")
     parser.add_argument("--adb-path", type=str, default=None,
                         help="explicit path to adb executable")
     parser.add_argument("--demo", action="store_true",
-                        help="run interactive simulation mode without needing an Android device")
+                        help="run interactive simulation mode with diagonal asteroids without phone")
     parser.add_argument("--image", type=str, default=None,
                         help="analyze a single static screenshot image and display detections")
     parser.add_argument("--preview-scale", type=float, default=None,
-                        help="scale preview window display size (e.g. 0.6 for high-res screens)")
+                        help="scale preview window display size (e.g. 0.5 for high-res screens)")
     args = parser.parse_args()
 
     # Mode 1: Static Image Inspection
@@ -401,58 +555,59 @@ def main():
     adb_exe = None
     if not args.demo:
         adb_exe = find_adb(args.adb_path)
-        print("Checking ADB environment...")
+        print("Checking ADB environment...", flush=True)
         if adb_exe:
-            print(f"ADB located at: {adb_exe}")
+            print(f"ADB located at: {adb_exe}", flush=True)
         else:
-            print("\n[!] ADB executable was not found on PATH or standard Android SDK locations.")
+            print("\n[!] ADB executable was not found on PATH or standard Android SDK locations.", flush=True)
             print("To run with an Android device:")
             print("  1. Download Android Platform Tools: https://developer.android.com/tools/releases/platform-tools")
             print("  2. Pass --adb-path <path_to_adb.exe> or add it to your system PATH.")
-            print("\nTip: You can run with '--demo' to test the bot's detection and UI preview right now without a device!\n")
+            print("\nTip: Run with '--demo' to test the bot's detection and UI preview right now without a device!\n", flush=True)
             sys.exit(1)
 
         # Check connected devices
         try:
             connected_devices, raw_devices_out = list_connected_devices(adb_exe)
-            print(raw_devices_out.strip())
+            print(raw_devices_out.strip(), flush=True)
         except Exception as exc:
-            print(f"Error querying ADB devices: {exc}")
+            print(f"Error querying ADB devices: {exc}", flush=True)
             sys.exit(1)
 
         if not connected_devices:
-            print("\n[!] No authorized Android device found.")
+            print("\n[!] No authorized Android device found.", flush=True)
             print("Troubleshooting checklist:")
             print("  1. Enable Developer Options on phone (tap Build Number 7 times).")
             print("  2. Turn on 'USB Debugging'.")
             print("  3. Unlock phone and tap 'Allow USB debugging' on the prompt.")
             print("  4. Check USB cable and mode (File Transfer / MTP).")
-            print("\nTip: Run with '--demo' to test the bot and CV detection right now without a phone!\n")
+            print("\nTip: Run with '--demo' to test the bot and CV detection right now without a phone!\n", flush=True)
             sys.exit(1)
 
         target_device = args.device or connected_devices[0]
         if len(connected_devices) > 1 and not args.device:
-            print(f"Multiple devices detected. Using primary device: {target_device}")
-            print(f"Use --device <serial> to choose another.")
+            print(f"Multiple devices detected. Using primary device: {target_device}", flush=True)
+            print(f"Use --device <serial> to choose another.", flush=True)
         else:
-            print(f"Targeting device: {target_device}")
+            print(f"Targeting device: {target_device}", flush=True)
     else:
-        print("\n--- RUNNING IN DEMO / SIMULATION MODE ---")
-        print("Simulating game screen with flying fireballs and bombs.")
-        print("Testing real-time heuristic detection and swipe decision logic.\n")
+        print("\n--- RUNNING IN DEMO / SIMULATION MODE ---", flush=True)
+        print("Simulating diagonal asteroids, falling fireballs, and devil hazards.", flush=True)
+        print("Testing multi-direction trajectory tracking & perpendicular auto-slicing.\n", flush=True)
         target_device = None
 
     if args.auto:
-        print("AUTO MODE ENABLED. Experimental heuristic swipes are active.")
-        print("Keep the phone visible and be ready to stop with Q or Ctrl+C.")
+        print("AUTO MODE ENABLED. Experimental heuristic swipes are active.", flush=True)
+        print("Devil ball safety guard is ACTIVE (strict buffer). Stop with Q or Ctrl+C.\n", flush=True)
     else:
-        print("OBSERVE-ONLY MODE: no physical swipes will be sent.")
-        print("Press Q or close preview window to quit.")
+        print("OBSERVE-ONLY MODE: no physical swipes will be sent.", flush=True)
+        print("Press Q or close preview window to quit.\n", flush=True)
 
     window_name = "Slice Bot - Q to quit"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     demo_sim = DemoSimulator() if args.demo else None
+    tracker = SimpleTracker()
     last_swipe = 0.0
     frame_count = 0
     fps = 0.0
@@ -471,14 +626,18 @@ def main():
                 try:
                     frame = capture_screen(device=target_device, adb_path=adb_exe)
                 except Exception as cap_err:
-                    print(f"Screen capture warning: {cap_err}. Retrying...")
-                    time.sleep(0.5)
+                    print(f"Screen capture warning: {cap_err}. Retrying...", flush=True)
+                    time.sleep(0.4)
                     continue
 
             # Run detection pipeline
             detections = detect_objects(frame)
             bombs = [d for d in detections if d.kind in ("BOMB", "UNKNOWN")]
             fireballs = [d for d in detections if d.kind == "FIREBALL"]
+
+            # Update multi-direction velocity tracker
+            now = time.time()
+            tracks = tracker.update(detections, now)
 
             # Calculate FPS
             frame_count += 1
@@ -487,80 +646,106 @@ def main():
                 frame_count = 0
                 fps_timer = time.time()
 
-            # Annotate detections
-            preview = frame.copy()
-            for d in detections:
-                x, y, w, h = d.box
-                if d.kind == "BOMB":
-                    color = (0, 0, 255)
-                elif d.kind == "FIREBALL":
-                    color = (0, 220, 0)
-                else:
-                    color = (0, 190, 255)
-                label = f"{d.kind} {d.confidence:.2f}"
-                cv2.rectangle(preview, (x, y), (x+w, y+h), color, 2)
-                cv2.putText(preview, label, (x, max(20, y-6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-
             H_frame, W_frame = frame.shape[:2]
             zone_top = int(H_frame * args.zone_min)
             zone_bottom = int(H_frame * args.zone_max)
 
+            # Annotate detections and tracks
+            preview = frame.copy()
+
             # Draw visual slice zone boundaries
             cv2.line(preview, (0, zone_top), (W_frame, zone_top), (100, 100, 100), 1)
-            cv2.putText(preview, "SLICE ZONE (TOP)", (W_frame - 150, max(15, zone_top - 6)),
+            cv2.putText(preview, "ZONE TOP", (W_frame - 110, max(15, zone_top - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1)
             cv2.line(preview, (0, zone_bottom), (W_frame, zone_bottom), (100, 100, 100), 1)
-            cv2.putText(preview, "SLICE ZONE (BOTTOM)", (W_frame - 170, min(H_frame - 6, zone_bottom + 16)),
+            cv2.putText(preview, "ZONE BOTTOM", (W_frame - 130, min(H_frame - 6, zone_bottom + 16)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1)
+
+            for d in detections:
+                x, y, w, h = d.box
+                if d.kind == "BOMB":
+                    color = (0, 0, 255)
+                    label = f"DEVIL {d.confidence:.2f}"
+                elif d.kind == "FIREBALL":
+                    color = (0, 220, 0)
+                    label = f"FIRE {d.confidence:.2f}"
+                else:
+                    color = (0, 190, 255)
+                    label = f"HAZARD {d.confidence:.2f}"
+                cv2.rectangle(preview, (x, y), (x+w, y+h), color, 2)
+                cv2.putText(preview, label, (x, max(20, y-6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+            # Draw velocity indicators for tracked fireballs
+            for tid, tinfo in tracks.items():
+                if tinfo["kind"] == "FIREBALL":
+                    cx, cy = int(tinfo["cx"]), int(tinfo["cy"])
+                    vx, vy = tinfo["vx"], tinfo["vy"]
+                    # Draw small trajectory arrow
+                    end_pt = (int(cx + vx * 0.12), int(cy + vy * 0.12))
+                    cv2.arrowedLine(preview, (cx, cy), end_pt, (0, 255, 255), 2, tipLength=0.3)
 
             status = "AUTO ON" if args.auto else "OBSERVE ONLY"
             demo_tag = " [DEMO]" if args.demo else ""
-            header = f"{status}{demo_tag} | FPS: {fps:.1f} | Detections: {len(detections)}"
+            header = f"{status}{demo_tag} | FPS: {fps:.1f} | Fireballs: {len(fireballs)} | Devils: {len(bombs)}"
             cv2.putText(preview, header, (12, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            # Falling fireball slice action: prioritize lowest fireball within active slicing zone
-            now = time.time()
-            if args.auto and fireballs and now - last_swipe >= args.cooldown:
-                # Filter candidates inside the slice zone
+            # Auto Slicing Decision
+            if args.auto and tracks and now - last_swipe >= args.cooldown:
+                # Filter fireballs inside the slice zone with sufficient confidence
                 valid_fireballs = [
-                    d for d in fireballs
-                    if d.confidence >= args.min_confidence
-                    and zone_top <= (d.box[1] + d.box[3] // 2) <= zone_bottom
+                    tinfo for tinfo in tracks.values()
+                    if tinfo["kind"] == "FIREBALL"
+                    and tinfo["confidence"] >= args.min_confidence
+                    and zone_top <= tinfo["cy"] <= zone_bottom
                 ]
-                # Prioritize lowest on screen (furthest fallen / most urgent)
-                valid_fireballs.sort(key=lambda d: d.box[1] + d.box[3] // 2, reverse=True)
 
-                half_stroke = max(30, args.swipe_length // 2)
+                # Prioritize most urgent: lowest vertical depth (highest cy)
+                valid_fireballs.sort(key=lambda t: t["cy"], reverse=True)
+
+                half_stroke = max(35, args.swipe_length // 2)
+
                 for target in valid_fireballs:
-                    x, y, w, h = target.box
-                    cx, cy = x + w // 2, y + h // 2
+                    cx, cy = target["cx"], target["cy"]
+                    vx, vy = target["vx"], target["vy"]
 
-                    # Horizontal swipe cutting across the falling path
-                    x1 = max(5, cx - half_stroke)
-                    x2 = min(W_frame - 5, cx + half_stroke)
-                    y1 = cy
-                    y2 = cy
-
-                    # Ensure no bomb or hazard is along the swipe path
-                    blocked = any(
-                        segment_distance_to_rect(x1, y1, x2, y2, d.box)
-                        for d in bombs
+                    # Compute perpendicular swipe endpoints with lead time compensation
+                    x1, y1, x2, y2 = compute_swipe_endpoints(
+                        cx, cy, vx, vy,
+                        half_stroke=half_stroke,
+                        W_frame=W_frame, H_frame=H_frame,
+                        lead_time=args.lead_time
                     )
+
+                    # Strict devil ball hazard check: never slice if devil ball is nearby
+                    blocked = is_swipe_blocked_by_hazards(
+                        x1, y1, x2, y2,
+                        hazards=bombs,
+                        safety_margin=args.devil_margin,
+                        lead_time=args.lead_time
+                    )
+
                     if not blocked:
+                        speed = math.hypot(vx, vy)
+                        angle_deg = math.degrees(math.atan2(vy, vx))
                         if args.demo:
                             demo_sim.trigger_swipe(x1, y1, x2, y2)
-                            print(f"[Demo] Sliced falling fireball at ({cx}, {cy}) score={target.confidence:.2f}", flush=True)
+                            print(f"[Demo] Sliced fireball at ({int(cx)}, {int(cy)}) spd={speed:.0f}px/s ang={angle_deg:.0f}° score={target['confidence']:.2f}", flush=True)
                         else:
                             send_swipe(x1, y1, x2, y2, duration_ms=args.swipe_duration, device=target_device, adb_path=adb_exe)
-                            print(f"Auto swipe at ({cx}, {cy}) score={target.confidence:.2f}", flush=True)
-                        # Flash swipe on preview
+                            print(f"Auto swipe at ({int(cx)}, {int(cy)}) spd={speed:.0f}px/s ang={angle_deg:.0f}° score={target['confidence']:.2f}", flush=True)
+
+                        # Flash swipe cut on preview
                         cv2.line(preview, (x1, y1), (x2, y2), (255, 255, 255), 3)
                         last_swipe = now
                         break
+                    else:
+                        # Log hazard avoidance
+                        # (Target was near a devil ball, skipping to protect score)
+                        pass
 
-            # Scale preview if requested or if height is large
+            # Scale preview display if requested or if height is large
             display_frame = preview
             H, W = preview.shape[:2]
             scale = args.preview_scale
@@ -577,14 +762,14 @@ def main():
             if key in (ord("q"), ord("Q"), 27):
                 break
 
-            time.sleep(0.03 if args.demo else 0.04)
+            time.sleep(0.025 if args.demo else 0.035)
 
     except KeyboardInterrupt:
-        print("\nStopping.")
+        print("\nStopping.", flush=True)
     except Exception as exc:
-        print(f"\nError: {exc}")
+        print(f"\nError: {exc}", flush=True)
         if not args.demo:
-            print("Verify adb devices and that the phone is unlocked.")
+            print("Verify adb devices and that the phone is unlocked.", flush=True)
     finally:
         cv2.destroyAllWindows()
 
