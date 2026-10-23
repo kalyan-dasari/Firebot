@@ -502,23 +502,48 @@ def main():
                 cv2.putText(preview, label, (x, max(20, y-6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
+            H_frame, W_frame = frame.shape[:2]
+            zone_top = int(H_frame * args.zone_min)
+            zone_bottom = int(H_frame * args.zone_max)
+
+            # Draw visual slice zone boundaries
+            cv2.line(preview, (0, zone_top), (W_frame, zone_top), (100, 100, 100), 1)
+            cv2.putText(preview, "SLICE ZONE (TOP)", (W_frame - 150, max(15, zone_top - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1)
+            cv2.line(preview, (0, zone_bottom), (W_frame, zone_bottom), (100, 100, 100), 1)
+            cv2.putText(preview, "SLICE ZONE (BOTTOM)", (W_frame - 170, min(H_frame - 6, zone_bottom + 16)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1)
+
             status = "AUTO ON" if args.auto else "OBSERVE ONLY"
             demo_tag = " [DEMO]" if args.demo else ""
             header = f"{status}{demo_tag} | FPS: {fps:.1f} | Detections: {len(detections)}"
             cv2.putText(preview, header, (12, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            # Experimental swipe action
+            # Falling fireball slice action: prioritize lowest fireball within active slicing zone
             now = time.time()
             if args.auto and fireballs and now - last_swipe >= args.cooldown:
-                fireballs.sort(key=lambda d: d.confidence, reverse=True)
-                target = fireballs[0]
-                if target.confidence >= args.min_confidence:
+                # Filter candidates inside the slice zone
+                valid_fireballs = [
+                    d for d in fireballs
+                    if d.confidence >= args.min_confidence
+                    and zone_top <= (d.box[1] + d.box[3] // 2) <= zone_bottom
+                ]
+                # Prioritize lowest on screen (furthest fallen / most urgent)
+                valid_fireballs.sort(key=lambda d: d.box[1] + d.box[3] // 2, reverse=True)
+
+                half_stroke = max(30, args.swipe_length // 2)
+                for target in valid_fireballs:
                     x, y, w, h = target.box
                     cx, cy = x + w // 2, y + h // 2
-                    x1, y1 = max(1, cx - max(12, w // 4)), cy
-                    x2, y2 = min(frame.shape[1]-2, cx + max(12, w // 4)), cy
 
+                    # Horizontal swipe cutting across the falling path
+                    x1 = max(5, cx - half_stroke)
+                    x2 = min(W_frame - 5, cx + half_stroke)
+                    y1 = cy
+                    y2 = cy
+
+                    # Ensure no bomb or hazard is along the swipe path
                     blocked = any(
                         segment_distance_to_rect(x1, y1, x2, y2, d.box)
                         for d in bombs
@@ -526,11 +551,14 @@ def main():
                     if not blocked:
                         if args.demo:
                             demo_sim.trigger_swipe(x1, y1, x2, y2)
-                            print(f"[Demo] Simulated swipe at ({cx}, {cy}) score={target.confidence:.2f}")
+                            print(f"[Demo] Sliced falling fireball at ({cx}, {cy}) score={target.confidence:.2f}")
                         else:
-                            send_swipe(x1, y1, x2, y2, 100, device=target_device, adb_path=adb_exe)
-                            print(f"Experimental swipe at ({cx}, {cy}) score={target.confidence:.2f}")
+                            send_swipe(x1, y1, x2, y2, duration_ms=args.swipe_duration, device=target_device, adb_path=adb_exe)
+                            print(f"Auto swipe at ({cx}, {cy}) score={target.confidence:.2f}")
+                        # Flash swipe on preview
+                        cv2.line(preview, (x1, y1), (x2, y2), (255, 255, 255), 3)
                         last_swipe = now
+                        break
 
             # Scale preview if requested or if height is large
             display_frame = preview
