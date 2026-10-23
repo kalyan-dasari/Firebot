@@ -551,10 +551,10 @@ def main():
                     if not blocked:
                         if args.demo:
                             demo_sim.trigger_swipe(x1, y1, x2, y2)
-                            print(f"[Demo] Sliced falling fireball at ({cx}, {cy}) score={target.confidence:.2f}")
+                            print(f"[Demo] Sliced falling fireball at ({cx}, {cy}) score={target.confidence:.2f}", flush=True)
                         else:
                             send_swipe(x1, y1, x2, y2, duration_ms=args.swipe_duration, device=target_device, adb_path=adb_exe)
-                            print(f"Auto swipe at ({cx}, {cy}) score={target.confidence:.2f}")
+                            print(f"Auto swipe at ({cx}, {cy}) score={target.confidence:.2f}", flush=True)
                         # Flash swipe on preview
                         cv2.line(preview, (x1, y1), (x2, y2), (255, 255, 255), 3)
                         last_swipe = now
