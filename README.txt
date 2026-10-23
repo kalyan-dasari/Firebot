@@ -45,15 +45,23 @@ During installation, select "Add Python to PATH".
 Extract this project folder. Open Command Prompt in the project folder and run:
     py -m pip install -r requirements.txt
 
-If ADB is not on PATH, either add platform-tools to PATH or edit slice_bot.py
-so its ADB commands use the full path to adb.exe.
+ADB is auto-detected from standard Android SDK locations automatically.
+You can also specify --adb-path if installed in a custom location.
 
 4. FIRST RUN: SCREEN CAPTURE + VISUAL DETECTION
 -----------------------------------------------
 Run:
     py slice_bot.py
+(Or double-click run_bot.bat)
 
-A window should show the live phone screen with boxes:
+TESTING WITHOUT A PHONE (DEMO MODE):
+------------------------------------
+You can test the bot and its OpenCV detection loop without a phone:
+    py slice_bot.py --demo
+Or test with auto slicing enabled in simulation:
+    py slice_bot.py --demo --auto
+
+A window will show the screen with candidate boxes:
 - Green = FIREBALL candidate
 - Red = BOMB candidate
 - Orange = UNKNOWN candidate
@@ -85,6 +93,11 @@ visible and stop with Q or Ctrl+C if it behaves incorrectly.
 
 Useful options:
     py slice_bot.py --auto --min-confidence 0.78 --cooldown 0.8
+    py slice_bot.py --demo                      # test without phone
+    py slice_bot.py --image test.png            # calibrate on static screenshot
+    py slice_bot.py --preview-scale 0.5         # scale preview window size
+    py slice_bot.py --device <serial>           # select target ADB device
+    py slice_bot.py --adb-path C:\path\adb.exe  # custom adb path
 
 A higher confidence threshold reduces some false positives but may miss
 targets. The bounding-box safety check is deliberately conservative but is
@@ -94,7 +107,7 @@ TROUBLESHOOTING
 ---------------
 - "unauthorized": unlock phone and accept the USB debugging prompt.
 - "no devices": try another USB cable/port; some cables are charge-only.
-- adb not found: add Platform Tools to PATH or use the full path to adb.exe.
+- adb not found: install Platform Tools (or Android Studio) or use --adb-path.
 - screenshot is rotated/different resolution: the bot uses the screenshot's
   coordinate space; test input carefully before automation.
 - game blocks input or automation: stop and respect the game's rules.
