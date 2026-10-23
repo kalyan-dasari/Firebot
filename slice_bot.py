@@ -368,10 +368,18 @@ def main():
     parser = argparse.ArgumentParser(description="USB-connected Slice game bot starter for Android")
     parser.add_argument("--auto", action="store_true",
                         help="enable experimental swipes (disabled by default)")
-    parser.add_argument("--min-confidence", type=float, default=0.68,
-                        help="minimum heuristic fireball score for auto mode")
-    parser.add_argument("--cooldown", type=float, default=0.65,
-                        help="minimum seconds between automated swipes")
+    parser.add_argument("--min-confidence", type=float, default=0.60,
+                        help="minimum heuristic fireball score for auto mode (default: 0.60)")
+    parser.add_argument("--cooldown", type=float, default=0.55,
+                        help="minimum seconds between automated swipes (default: 0.55)")
+    parser.add_argument("--swipe-length", type=int, default=120,
+                        help="length of horizontal slice cut in pixels (default: 120)")
+    parser.add_argument("--swipe-duration", type=int, default=70,
+                        help="swipe touch duration in ms (default: 70)")
+    parser.add_argument("--zone-min", type=float, default=0.15,
+                        help="top fraction of screen to ignore, e.g. top UI (default: 0.15)")
+    parser.add_argument("--zone-max", type=float, default=0.85,
+                        help="bottom fraction of screen to ignore, e.g. bottom bar (default: 0.85)")
     parser.add_argument("--device", "-s", type=str, default=None,
                         help="target specific ADB device serial if multiple devices are attached")
     parser.add_argument("--adb-path", type=str, default=None,
