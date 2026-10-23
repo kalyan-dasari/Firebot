@@ -253,7 +253,7 @@ def send_swipe(x1, y1, x2, y2, duration_ms=100, device: Optional[str] = None, ad
 
 
 class DemoSimulator:
-    """Simulates real-time gameplay objects for demo and test runs."""
+    """Simulates real-time gameplay with fireballs falling from top to bottom."""
 
     def __init__(self, width: int = 540, height: int = 960):
         self.width = width
@@ -262,13 +262,12 @@ class DemoSimulator:
         self.swipes = []  # active visual swipe animations
         self.last_spawn = 0.0  # Spawn immediately on start
 
-
     def _spawn_object(self):
         kind = random.choices(["FIREBALL", "BOMB"], weights=[0.75, 0.25])[0]
-        x = random.randint(int(self.width * 0.2), int(self.width * 0.8))
-        y = self.height + 20
-        vx = random.uniform(-2.5, 2.5)
-        vy = random.uniform(-19, -15)
+        x = random.randint(int(self.width * 0.15), int(self.width * 0.85))
+        y = -25  # Spawn above the screen, falling downwards
+        vx = random.uniform(-1.0, 1.0)
+        vy = random.uniform(5.5, 9.5)  # Downward velocity
         self.objects.append({
             "x": x, "y": y, "vx": vx, "vy": vy,
             "kind": kind, "alive": True
@@ -276,24 +275,25 @@ class DemoSimulator:
 
     def trigger_swipe(self, x1, y1, x2, y2):
         self.swipes.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "alpha": 1.0})
-        # Check if any fireball was sliced
+        # Check if any falling fireball intersects the horizontal swipe segment
+        sx_min, sx_max = min(x1, x2), max(x1, x2)
         for obj in self.objects:
             if obj["kind"] == "FIREBALL" and obj["alive"]:
                 ox, oy = obj["x"], obj["y"]
-                if min(x1, x2) - 30 <= ox <= max(x1, x2) + 30 and abs(oy - y1) < 40:
+                if sx_min - 25 <= ox <= sx_max + 25 and abs(oy - y1) < 45:
                     obj["alive"] = False
 
     def next_frame(self) -> np.ndarray:
         now = time.time()
-        if now - self.last_spawn > random.uniform(1.0, 1.8):
+        if now - self.last_spawn > random.uniform(0.9, 1.5):
             self._spawn_object()
             self.last_spawn = now
 
-        # Dark sleek background
+        # Dark game background
         frame = np.full((self.height, self.width, 3), (22, 18, 28), dtype=np.uint8)
 
-        # Update and render objects
-        gravity = 0.42
+        # Update and render falling objects
+        gravity = 0.22
         for obj in self.objects:
             obj["x"] += obj["vx"]
             obj["y"] += obj["vy"]
@@ -304,9 +304,9 @@ class DemoSimulator:
                 continue
 
             if obj["kind"] == "FIREBALL":
-                # Outer warm flame
-                cv2.ellipse(frame, (ox, oy + 8), (22, 34), 0, 0, 360, (25, 130, 255), -1)
-                # Bright white core
+                # Fireball falling down: flame trail points UPWARDS behind head
+                cv2.ellipse(frame, (ox, oy - 12), (20, 32), 0, 0, 360, (25, 130, 255), -1)
+                # Bright white core at the leading head
                 cv2.circle(frame, (ox, oy), 13, (255, 255, 255), -1)
             else:
                 # Bomb: dark body with warm outline & red eyes
@@ -315,7 +315,7 @@ class DemoSimulator:
                 cv2.circle(frame, (ox - 7, oy - 4), 3, (15, 15, 240), -1)
                 cv2.circle(frame, (ox + 7, oy - 4), 3, (15, 15, 240), -1)
 
-        # Remove fallen objects
+        # Remove objects that reached the bottom
         self.objects = [o for o in self.objects if o["y"] < self.height + 60 and o["alive"]]
 
         # Draw swipe trails
@@ -325,7 +325,7 @@ class DemoSimulator:
             p2 = (int(s["x2"]), int(s["y2"]))
             color = (int(255 * s["alpha"]), int(255 * s["alpha"]), int(255 * s["alpha"]))
             cv2.line(frame, p1, p2, color, max(1, int(4 * s["alpha"])))
-            s["alpha"] -= 0.15
+            s["alpha"] -= 0.18
             if s["alpha"] > 0:
                 active_swipes.append(s)
         self.swipes = active_swipes
