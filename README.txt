@@ -91,9 +91,12 @@ Only after testing observe-only mode, run:
 This enables heuristic swipes. It is not guaranteed safe. Keep the phone
 visible and stop with Q or Ctrl+C if it behaves incorrectly.
 
-Useful options:
-    py slice_bot.py --auto --min-confidence 0.78 --cooldown 0.8
-    py slice_bot.py --demo                      # test without phone
+Useful options for falling fireballs:
+    py slice_bot.py --auto --min-confidence 0.60 --cooldown 0.5
+    py slice_bot.py --swipe-length 140          # width of horizontal cut (pixels)
+    py slice_bot.py --zone-min 0.15 --zone-max 0.85 # slice zone (ignores top/bottom UI)
+    py slice_bot.py --demo                      # test simulation without phone
+    py slice_bot.py --demo --auto               # test auto-slicing simulation
     py slice_bot.py --image test.png            # calibrate on static screenshot
     py slice_bot.py --preview-scale 0.5         # scale preview window size
     py slice_bot.py --device <serial>           # select target ADB device
