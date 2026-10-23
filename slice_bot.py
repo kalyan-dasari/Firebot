@@ -9,10 +9,15 @@ Detection is a starter heuristic, not a trained classifier. Calibrate it
 against real gameplay before enabling actions.
 """
 import argparse
+import math
+import os
+import random
+import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -25,24 +30,110 @@ class Detection:
     confidence: float
 
 
-def run_adb(args, timeout=5):
+# Cached ADB path once resolved
+RESOLVED_ADB_PATH: Optional[str] = None
+
+
+def find_adb(custom_path: Optional[str] = None) -> Optional[str]:
+    """Locate the adb executable on the system."""
+    global RESOLVED_ADB_PATH
+    if custom_path:
+        if os.path.isfile(custom_path):
+            RESOLVED_ADB_PATH = os.path.abspath(custom_path)
+            return RESOLVED_ADB_PATH
+        raise FileNotFoundError(f"Custom ADB path does not exist: {custom_path}")
+
+    if RESOLVED_ADB_PATH and os.path.isfile(RESOLVED_ADB_PATH):
+        return RESOLVED_ADB_PATH
+
+    # Check environment variable
+    env_adb = os.environ.get("ADB_PATH")
+    if env_adb and os.path.isfile(env_adb):
+        RESOLVED_ADB_PATH = os.path.abspath(env_adb)
+        return RESOLVED_ADB_PATH
+
+    # Check system PATH
+    which_adb = shutil.which("adb")
+    if which_adb:
+        RESOLVED_ADB_PATH = os.path.abspath(which_adb)
+        return RESOLVED_ADB_PATH
+
+    # Common Windows installation locations
+    candidates = [
+        os.path.expandvars(r"%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe"),
+        os.path.expandvars(r"%ANDROID_HOME%\platform-tools\adb.exe"),
+        os.path.expandvars(r"%ANDROID_SDK_ROOT%\platform-tools\adb.exe"),
+        r"C:\platform-tools\adb.exe",
+        r"C:\Android\platform-tools\adb.exe",
+        r"C:\Program Files\Android\platform-tools\adb.exe",
+        r"C:\Program Files (x86)\Android\android-sdk\platform-tools\adb.exe",
+    ]
+    for cand in candidates:
+        if cand and os.path.isfile(cand):
+            RESOLVED_ADB_PATH = os.path.abspath(cand)
+            return RESOLVED_ADB_PATH
+
+    return None
+
+
+def run_adb(args: List[str], timeout: float = 5, device: Optional[str] = None, adb_path: Optional[str] = None):
+    """Run an ADB command safely with process window suppression on Windows."""
+    exe = adb_path or find_adb()
+    if not exe:
+        raise FileNotFoundError(
+            "ADB executable not found. Please ensure Android SDK Platform Tools is installed "
+            "or specify --adb-path."
+        )
+
+    cmd = [exe]
+    if device:
+        cmd.extend(["-s", device])
+    cmd.extend(args)
+
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
     return subprocess.run(
-        ["adb", *args],
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=timeout,
         check=False,
+        creationflags=creationflags,
     )
 
 
-def capture_screen():
+def list_connected_devices(adb_path: Optional[str] = None) -> Tuple[List[str], str]:
+    """Return list of authorized device IDs and raw adb output."""
+    p = run_adb(["devices"], timeout=6, adb_path=adb_path)
+    raw_output = p.stdout.decode(errors="replace")
+    devices = []
+    for line in raw_output.splitlines()[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            devices.append(parts[0])
+    return devices, raw_output
+
+
+def capture_screen(device: Optional[str] = None, adb_path: Optional[str] = None) -> np.ndarray:
     """Return BGR screenshot from the connected Android device."""
-    p = run_adb(["exec-out", "screencap", "-p"], timeout=8)
+    p = run_adb(["exec-out", "screencap", "-p"], timeout=8, device=device, adb_path=adb_path)
     if p.returncode != 0 or not p.stdout:
         msg = p.stderr.decode(errors="replace").strip()
         raise RuntimeError("ADB screenshot failed. " + msg)
+
     arr = np.frombuffer(p.stdout, dtype=np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    # Fallback for Windows carriage-return translation on older ADB versions
+    if frame is None and p.stdout:
+        clean_bytes = p.stdout.replace(b"\r\r\n", b"\r\n").replace(b"\r\n", b"\n")
+        frame = cv2.imdecode(np.frombuffer(clean_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+
     if frame is None:
         raise RuntimeError("Could not decode screenshot returned by ADB.")
     return frame
@@ -150,50 +241,245 @@ def segment_distance_to_rect(x1, y1, x2, y2, rect):
     return not (sx2 < left or sx1 > right or sy2 < top or sy1 > bottom)
 
 
-def send_swipe(x1, y1, x2, y2, duration_ms=100):
+def send_swipe(x1, y1, x2, y2, duration_ms=100, device: Optional[str] = None, adb_path: Optional[str] = None):
+    """Send an automated touch swipe event via ADB."""
     p = run_adb([
         "shell", "input", "swipe",
         str(int(x1)), str(int(y1)), str(int(x2)), str(int(y2)),
         str(int(duration_ms))
-    ], timeout=5)
+    ], timeout=5, device=device, adb_path=adb_path)
     if p.returncode != 0:
         raise RuntimeError(p.stderr.decode(errors="replace").strip() or "ADB swipe failed")
 
 
+class DemoSimulator:
+    """Simulates real-time gameplay objects for demo and test runs."""
+
+    def __init__(self, width: int = 540, height: int = 960):
+        self.width = width
+        self.height = height
+        self.objects = []
+        self.swipes = []  # active visual swipe animations
+        self.last_spawn = time.time()
+
+    def _spawn_object(self):
+        kind = random.choices(["FIREBALL", "BOMB"], weights=[0.75, 0.25])[0]
+        x = random.randint(int(self.width * 0.2), int(self.width * 0.8))
+        y = self.height + 20
+        vx = random.uniform(-2.5, 2.5)
+        vy = random.uniform(-19, -15)
+        self.objects.append({
+            "x": x, "y": y, "vx": vx, "vy": vy,
+            "kind": kind, "alive": True
+        })
+
+    def trigger_swipe(self, x1, y1, x2, y2):
+        self.swipes.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "alpha": 1.0})
+        # Check if any fireball was sliced
+        for obj in self.objects:
+            if obj["kind"] == "FIREBALL" and obj["alive"]:
+                ox, oy = obj["x"], obj["y"]
+                if min(x1, x2) - 30 <= ox <= max(x1, x2) + 30 and abs(oy - y1) < 40:
+                    obj["alive"] = False
+
+    def next_frame(self) -> np.ndarray:
+        now = time.time()
+        if now - self.last_spawn > random.uniform(1.0, 1.8):
+            self._spawn_object()
+            self.last_spawn = now
+
+        # Dark sleek background
+        frame = np.full((self.height, self.width, 3), (22, 18, 28), dtype=np.uint8)
+
+        # Update and render objects
+        gravity = 0.42
+        for obj in self.objects:
+            obj["x"] += obj["vx"]
+            obj["y"] += obj["vy"]
+            obj["vy"] += gravity
+
+            ox, oy = int(obj["x"]), int(obj["y"])
+            if not obj["alive"]:
+                continue
+
+            if obj["kind"] == "FIREBALL":
+                # Outer warm flame
+                cv2.ellipse(frame, (ox, oy + 8), (22, 34), 0, 0, 360, (25, 130, 255), -1)
+                # Bright white core
+                cv2.circle(frame, (ox, oy), 13, (255, 255, 255), -1)
+            else:
+                # Bomb: dark body with warm outline & red eyes
+                cv2.circle(frame, (ox, oy), 26, (15, 95, 230), 4)
+                cv2.circle(frame, (ox, oy), 22, (32, 32, 32), -1)
+                cv2.circle(frame, (ox - 7, oy - 4), 3, (15, 15, 240), -1)
+                cv2.circle(frame, (ox + 7, oy - 4), 3, (15, 15, 240), -1)
+
+        # Remove fallen objects
+        self.objects = [o for o in self.objects if o["y"] < self.height + 60 and o["alive"]]
+
+        # Draw swipe trails
+        active_swipes = []
+        for s in self.swipes:
+            p1 = (int(s["x1"]), int(s["y1"]))
+            p2 = (int(s["x2"]), int(s["y2"]))
+            color = (int(255 * s["alpha"]), int(255 * s["alpha"]), int(255 * s["alpha"]))
+            cv2.line(frame, p1, p2, color, max(1, int(4 * s["alpha"])))
+            s["alpha"] -= 0.15
+            if s["alpha"] > 0:
+                active_swipes.append(s)
+        self.swipes = active_swipes
+
+        return frame
+
+
+def process_image_file(image_path: str):
+    """Test object detection heuristics on a static screenshot file."""
+    if not os.path.isfile(image_path):
+        print(f"Error: Screenshot file not found: {image_path}")
+        sys.exit(1)
+
+    frame = cv2.imread(image_path)
+    if frame is None:
+        print(f"Error: Could not decode image at {image_path}")
+        sys.exit(1)
+
+    print(f"Analyzing {image_path} ({frame.shape[1]}x{frame.shape[0]})...")
+    detections = detect_objects(frame)
+    print(f"Found {len(detections)} candidate detections:")
+
+    for i, d in enumerate(detections, 1):
+        x, y, w, h = d.box
+        print(f"  [{i}] {d.kind:<9} conf={d.confidence:.2f} box=(x={x}, y={y}, w={w}, h={h})")
+        color = (0, 0, 255) if d.kind == "BOMB" else ((0, 220, 0) if d.kind == "FIREBALL" else (0, 190, 255))
+        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+        cv2.putText(frame, f"{d.kind} {d.confidence:.2f}", (x, max(20, y-6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+    window_name = f"Slice Bot Analysis - {os.path.basename(image_path)}"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.imshow(window_name, frame)
+    print("\nPress any key in the image window to close.")
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
 def main():
-    parser = argparse.ArgumentParser(description="USB-connected Slice game bot starter")
+    parser = argparse.ArgumentParser(description="USB-connected Slice game bot starter for Android")
     parser.add_argument("--auto", action="store_true",
                         help="enable experimental swipes (disabled by default)")
     parser.add_argument("--min-confidence", type=float, default=0.68,
                         help="minimum heuristic fireball score for auto mode")
     parser.add_argument("--cooldown", type=float, default=0.65,
                         help="minimum seconds between automated swipes")
+    parser.add_argument("--device", "-s", type=str, default=None,
+                        help="target specific ADB device serial if multiple devices are attached")
+    parser.add_argument("--adb-path", type=str, default=None,
+                        help="explicit path to adb executable")
+    parser.add_argument("--demo", action="store_true",
+                        help="run interactive simulation mode without needing an Android device")
+    parser.add_argument("--image", type=str, default=None,
+                        help="analyze a single static screenshot image and display detections")
+    parser.add_argument("--preview-scale", type=float, default=None,
+                        help="scale preview window display size (e.g. 0.6 for high-res screens)")
     args = parser.parse_args()
 
-    print("Checking ADB device...")
-    devices = run_adb(["devices"])
-    print(devices.stdout.decode(errors="replace"))
-    if devices.returncode != 0 or b"\tdevice" not in devices.stdout:
-        print("\nNo authorized Android device found.")
-        print("Check USB debugging, accept the phone's authorization prompt, then retry.")
-        sys.exit(1)
+    # Mode 1: Static Image Inspection
+    if args.image:
+        process_image_file(args.image)
+        return
+
+    # Check / Locate ADB
+    adb_exe = None
+    if not args.demo:
+        adb_exe = find_adb(args.adb_path)
+        print("Checking ADB environment...")
+        if adb_exe:
+            print(f"ADB located at: {adb_exe}")
+        else:
+            print("\n[!] ADB executable was not found on PATH or standard Android SDK locations.")
+            print("To run with an Android device:")
+            print("  1. Download Android Platform Tools: https://developer.android.com/tools/releases/platform-tools")
+            print("  2. Pass --adb-path <path_to_adb.exe> or add it to your system PATH.")
+            print("\nTip: You can run with '--demo' to test the bot's detection and UI preview right now without a device!\n")
+            sys.exit(1)
+
+        # Check connected devices
+        try:
+            connected_devices, raw_devices_out = list_connected_devices(adb_exe)
+            print(raw_devices_out.strip())
+        except Exception as exc:
+            print(f"Error querying ADB devices: {exc}")
+            sys.exit(1)
+
+        if not connected_devices:
+            print("\n[!] No authorized Android device found.")
+            print("Troubleshooting checklist:")
+            print("  1. Enable Developer Options on phone (tap Build Number 7 times).")
+            print("  2. Turn on 'USB Debugging'.")
+            print("  3. Unlock phone and tap 'Allow USB debugging' on the prompt.")
+            print("  4. Check USB cable and mode (File Transfer / MTP).")
+            print("\nTip: Run with '--demo' to test the bot and CV detection right now without a phone!\n")
+            sys.exit(1)
+
+        target_device = args.device or connected_devices[0]
+        if len(connected_devices) > 1 and not args.device:
+            print(f"Multiple devices detected. Using primary device: {target_device}")
+            print(f"Use --device <serial> to choose another.")
+        else:
+            print(f"Targeting device: {target_device}")
+    else:
+        print("\n--- RUNNING IN DEMO / SIMULATION MODE ---")
+        print("Simulating game screen with flying fireballs and bombs.")
+        print("Testing real-time heuristic detection and swipe decision logic.\n")
+        target_device = None
 
     if args.auto:
-        print("\nAUTO MODE ENABLED. Experimental heuristic detection may be wrong.")
+        print("AUTO MODE ENABLED. Experimental heuristic swipes are active.")
         print("Keep the phone visible and be ready to stop with Q or Ctrl+C.")
     else:
-        print("\nOBSERVE-ONLY MODE: no swipes will be sent.")
-        print("Press Q in the preview window to quit.")
+        print("OBSERVE-ONLY MODE: no physical swipes will be sent.")
+        print("Press Q or close preview window to quit.")
 
+    window_name = "Slice Bot - Q to quit"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    demo_sim = DemoSimulator() if args.demo else None
     last_swipe = 0.0
+    frame_count = 0
+    fps = 0.0
+    fps_timer = time.time()
+
     try:
         while True:
-            frame = capture_screen()
-            detections = detect_objects(frame)
+            # Check if user closed the OpenCV window
+            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                break
 
+            # Acquire frame
+            if args.demo:
+                frame = demo_sim.next_frame()
+            else:
+                try:
+                    frame = capture_screen(device=target_device, adb_path=adb_exe)
+                except Exception as cap_err:
+                    print(f"Screen capture warning: {cap_err}. Retrying...")
+                    time.sleep(0.5)
+                    continue
+
+            # Run detection pipeline
+            detections = detect_objects(frame)
             bombs = [d for d in detections if d.kind in ("BOMB", "UNKNOWN")]
             fireballs = [d for d in detections if d.kind == "FIREBALL"]
 
+            # Calculate FPS
+            frame_count += 1
+            if time.time() - fps_timer >= 1.0:
+                fps = frame_count / (time.time() - fps_timer)
+                frame_count = 0
+                fps_timer = time.time()
+
+            # Annotate detections
+            preview = frame.copy()
             for d in detections:
                 x, y, w, h = d.box
                 if d.kind == "BOMB":
@@ -203,17 +489,17 @@ def main():
                 else:
                     color = (0, 190, 255)
                 label = f"{d.kind} {d.confidence:.2f}"
-                cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-                cv2.putText(frame, label, (x, max(20, y-6)),
+                cv2.rectangle(preview, (x, y), (x+w, y+h), color, 2)
+                cv2.putText(preview, label, (x, max(20, y-6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
             status = "AUTO ON" if args.auto else "OBSERVE ONLY"
-            cv2.putText(frame, status, (12, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.imshow("Slice Bot - Q to quit", frame)
+            demo_tag = " [DEMO]" if args.demo else ""
+            header = f"{status}{demo_tag} | FPS: {fps:.1f} | Detections: {len(detections)}"
+            cv2.putText(preview, header, (12, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            # Experimental action: short swipe across the central area of a
-            # confident candidate. Any bomb/unknown candidate near its path blocks it.
+            # Experimental swipe action
             now = time.time()
             if args.auto and fireballs and now - last_swipe >= args.cooldown:
                 fireballs.sort(key=lambda d: d.confidence, reverse=True)
@@ -221,7 +507,6 @@ def main():
                 if target.confidence >= args.min_confidence:
                     x, y, w, h = target.box
                     cx, cy = x + w // 2, y + h // 2
-                    # Short horizontal swipe near the detected center.
                     x1, y1 = max(1, cx - max(12, w // 4)), cy
                     x2, y2 = min(frame.shape[1]-2, cx + max(12, w // 4)), cy
 
@@ -230,22 +515,39 @@ def main():
                         for d in bombs
                     )
                     if not blocked:
-                        send_swipe(x1, y1, x2, y2, 100)
+                        if args.demo:
+                            demo_sim.trigger_swipe(x1, y1, x2, y2)
+                            print(f"[Demo] Simulated swipe at ({cx}, {cy}) score={target.confidence:.2f}")
+                        else:
+                            send_swipe(x1, y1, x2, y2, 100, device=target_device, adb_path=adb_exe)
+                            print(f"Experimental swipe at ({cx}, {cy}) score={target.confidence:.2f}")
                         last_swipe = now
-                        print(f"Experimental swipe at ({cx}, {cy}) score={target.confidence:.2f}")
+
+            # Scale preview if requested or if height is large
+            display_frame = preview
+            H, W = preview.shape[:2]
+            scale = args.preview_scale
+            if scale is None and H > 1000:
+                scale = 750.0 / H
+            if scale and scale != 1.0:
+                new_w = int(W * scale)
+                new_h = int(H * scale)
+                display_frame = cv2.resize(preview, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            cv2.imshow(window_name, display_frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), ord("Q"), 27):
                 break
 
-            # Small pause to reduce CPU usage. Capture cadence depends on USB/device.
-            time.sleep(0.04)
+            time.sleep(0.03 if args.demo else 0.04)
 
     except KeyboardInterrupt:
         print("\nStopping.")
     except Exception as exc:
         print(f"\nError: {exc}")
-        print("Verify adb devices and that the phone is unlocked.")
+        if not args.demo:
+            print("Verify adb devices and that the phone is unlocked.")
     finally:
         cv2.destroyAllWindows()
 
