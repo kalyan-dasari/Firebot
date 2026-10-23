@@ -260,7 +260,8 @@ class DemoSimulator:
         self.height = height
         self.objects = []
         self.swipes = []  # active visual swipe animations
-        self.last_spawn = time.time()
+        self.last_spawn = 0.0  # Spawn immediately on start
+
 
     def _spawn_object(self):
         kind = random.choices(["FIREBALL", "BOMB"], weights=[0.75, 0.25])[0]
