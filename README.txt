@@ -1,81 +1,119 @@
-SLICE BOT STARTER — WINDOWS + ANDROID USB
-Specialized for Slice UPI 'Play Fire' Game
+================================================================================
+FIREBALL DETECTION & AUTO-SWIPE BOT — WINDOWS + ANDROID USB
+================================================================================
 
-IMPORTANT
----------
-The default mode is OBSERVE ONLY. It captures screenshots and draws
-heuristic candidate boxes. It does not swipe until --auto is passed.
+PROJECT OVERVIEW
+----------------
+This project aims to build a computer-vision-based game assistant that detects
+fireballs, avoids bomb-like hazards, and performs safe swipe gestures in
+compatible Android games.
 
-Detector Legend:
-- Green = FIREBALL candidate (meteors / asteroids)
-- Red = DEVIL BALL / BOMB candidate (hazards — strictly avoided)
-- Orange = UNKNOWN candidate
+The initial development environment is Windows 10/11, using Python, OpenCV, and
+Android Debug Bridge (ADB). A future version may use a native Android
+application with a floating on-screen control panel.
 
-Yellow arrows show the computed flight velocity vector and angle.
+For the formatted Markdown version, please see: README.md
 
-1. INSTALL ADB
---------------
-Download Android SDK Platform Tools:
-https://developer.android.com/tools/releases/platform-tools
+OBJECTIVES
+----------
+- Capture and process game screenshots over ADB or simulated environments.
+- Detect and classify fireballs, bombs, and uncertain objects.
+- Track moving objects across consecutive frames (vertical & diagonal asteroids).
+- Identify safe swipe paths while maintaining a strict safety margin around hazards.
+- Provide Start, Stop, and emergency-stop controls (Q key or window close).
+- Display detection results, trajectory vectors, and debugging information.
+- Support games that permit automated interaction.
 
-If you already have Android Studio installed, ADB is already located at:
-C:\Users\<user>\AppData\Local\Android\Sdk\platform-tools\adb.exe
-The bot detects this automatically!
+PLANNED TECHNOLOGY STACK
+------------------------
+- Python: Core automation and decision-making logic.
+- OpenCV: Image processing, color filtering, contour analysis, and GUI preview.
+- NumPy: Efficient array manipulations, vector calculations, and image decoding.
+- ADB: Android screen capture and touch input injection during compatible testing.
+- Kotlin (future): Optional native Android application.
+- Android Accessibility Service (future): Gesture automation where permitted.
 
-2. PHONE USB SETUP
+DEVELOPMENT PHASES
 ------------------
-1. On your phone: Settings > About phone > tap Build number 7 times.
-2. Settings > Developer options:
-   - USB debugging: ON
-   - USB debugging (Security settings): ON (allows simulated touch/swipes)
-3. Connect phone via USB, unlock it, and accept the "Allow USB debugging" prompt.
+Phase 1 — Screen Capture:
+Establish a connection to a compatible Android test device and capture screenshots.
+Auto-detects ADB in Android SDK platform-tools.
 
-3. INSTALL PYTHON DEPENDENCIES
-------------------------------
-Run:
-    py -m pip install -r requirements.txt
+Phase 2 — Object Detection:
+Identify candidate fireballs and bomb-like objects. Display bounding boxes and
+confidence scores.
 
-4. TESTING WITHOUT PHONE (DEMO MODE)
-------------------------------------
-Test real-time computer vision, diagonal asteroid flight, and swipe cuts:
-    py slice_bot.py --demo
+Phase 3 — Object Tracking:
+Track objects between frames and estimate their movement speed and angle.
 
-Test automated swiping and devil-ball hazard avoidance in simulation:
-    py slice_bot.py --demo --auto
+Phase 4 — Safe Swipe Planning:
+Select target fireballs, check proposed swipe paths against detected hazards,
+and skip uncertain targets or candidates near hazards.
 
-5. LIVE GAMEPLAY IN SLICE UPI APP
----------------------------------
-For a complete, step-by-step walkthrough on running the bot live on your
-phone while playing the Slice UPI Play Fire game, see:
-    SLICE_APP_GUIDE.md
+Phase 5 — Automation Interface:
+Add Start/Stop controls, a detection preview, configurable thresholds, static
+screenshot inspection (--image), and an offline interactive simulator (--demo).
 
-1. Open Slice UPI App > Play Fire game.
-2. Run Observe Mode first:
-    py slice_bot.py
-   (Or double-click run_bot.bat)
-3. Check that boxes track falling fireballs and devil balls.
-4. Enable Auto Slicing:
-    py slice_bot.py --auto
+Phase 6 — Testing and Optimization:
+Measure detection accuracy, false positives, missed hazards, response time, and
+resource usage.
 
-Useful options for Slice Fire Game:
-    py slice_bot.py --auto --min-confidence 0.58 --cooldown 0.40
-    py slice_bot.py --swipe-length 140          # stroke cut length (pixels)
-    py slice_bot.py --lead-time 0.07            # lead fast falling balls (touch latency comp)
-    py slice_bot.py --devil-margin 80           # strict safety radius around devil balls (px)
-    py slice_bot.py --zone-min 0.15 --zone-max 0.88 # safe slicing zone
-    py slice_bot.py --demo                      # test simulation with diagonal asteroids
-    py slice_bot.py --demo --auto               # test auto-slicing simulation
-    py slice_bot.py --image test.png            # calibrate on static screenshot
-    py slice_bot.py --preview-scale 0.5         # scale preview window size
-    py slice_bot.py --device <serial>           # select target ADB device
-    py slice_bot.py --adb-path C:\path\adb.exe  # custom adb path
+COMPATIBILITY AND SECURITY LIMITATIONS
+--------------------------------------
+Some applications, including financial applications (such as Slice UPI), may
+restrict access when USB debugging, wireless debugging, screen capture, or
+accessibility automation is enabled.
 
-TROUBLESHOOTING
----------------
-- "unauthorized": unlock phone and accept the USB debugging prompt.
-- "no devices": try another USB cable/port; some cables are charge-only.
-- swipes not registering: enable "USB Debugging (Security settings)" in Developer Options.
-- adb not found: install Platform Tools (or Android Studio) or use --adb-path.
-- screenshot is rotated/different resolution: the bot uses the screenshot's
-  coordinate space; test input carefully before automation.
-- game blocks input or automation: stop and respect the game's rules.
+The bot must not assume that ADB or accessibility gestures will work in every
+application. If an application blocks automation, development and testing should
+continue in a compatible test environment rather than attempting to conceal
+debugging, bypass security checks, or interfere with application protections.
+
+Attempting to bypass security checks on financial accounts risks triggering
+automated risk flags, account freezes, or forfeiture of rewards.
+
+This project does not guarantee compatibility with Slice or authorization to
+automate reward-bearing games. Any use with third-party games must comply with
+their terms and applicable rules.
+
+SAFETY REQUIREMENTS
+-------------------
+- Detection-only mode is the default.
+- Unknown or ambiguous objects must be treated as potential hazards.
+- Automated swipes must remain disabled until detection has been tested.
+- Include an accessible emergency-stop mechanism (Q key or window close).
+- Do not root a daily-use banking device solely to enable automation.
+- Never store banking credentials, payment information, or other sensitive
+  account data in the project.
+
+CURRENT STATUS
+--------------
+The initial Windows/Python implementation supports:
+- Automatic ADB discovery from Android SDK Platform-Tools.
+- Offline simulation mode (--demo) with diagonal asteroids and auto-slicing.
+- Static screenshot calibration (--image <path>).
+- Perpendicular swipe cuts tailored to falling angles.
+- Strict devil ball / bomb safety radius check.
+- Latency compensation (--lead-time) to lead moving targets.
+
+QUICK START COMMANDS
+--------------------
+1. Install Dependencies:
+   py -m pip install -r requirements.txt
+
+2. Test Offline Simulator (No phone needed):
+   py slice_bot.py --demo
+   py slice_bot.py --demo --auto
+
+3. Compatible Android Device Testing:
+   py slice_bot.py                                 # Observe mode
+   py slice_bot.py --auto                          # Auto slicing mode
+   py slice_bot.py --auto --swipe-length 140 --cooldown 0.40 --lead-time 0.07 --devil-margin 80
+
+SUCCESS CRITERIA
+----------------
+- Reliable screen capture in a compatible test environment.
+- Correct classification of representative fireballs and hazards.
+- Conservative behavior when objects overlap or detection is uncertain.
+- Safe, responsive controls and an effective emergency stop.
+- Documented limitations and repeatable test results.
